@@ -1,0 +1,164 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {ITrap} from "drosera-contracts/interfaces/ITrap.sol";
+
+/// Top-level interface (must be declared outside the contract)
+interface IDelegationManager {
+    function operatorStatus(address operator) external view returns (uint8);
+}
+
+/// OperatorStatusDriftTrap
+/// - collect() is external view returns (bytes memory) (no args) — Drosera-compliant
+/// - shouldRespond(bytes[] calldata) external pure returns (bool, bytes memory)
+contract OperatorStatusDriftTrap is ITrap {
+    address public owner;
+
+    // owner-set delegation manager (no constructor args)
+    address public delegationManager;
+
+    // owner-managed watched set (bounded list)
+    address[] public watchedOperators;
+    mapping(address => bool) public isWatched;
+    // snapshot of last seen status (owner sets via snapshot)
+    mapping(address => uint8) public lastSeenStatus;
+
+    event WatchedAdded(address operator);
+    event WatchedRemoved(address operator);
+    event Snapshot(address operator, uint8 status);
+    event DelegationManagerSet(address oldDm, address newDm);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "only owner");
+        _;
+    }
+
+    // no-args constructor required for Drosera redeploy-on-shadow-fork semantics
+    constructor() { owner = msg.sender; }
+
+    /* --------------- owner management --------------- */
+
+    function setDelegationManager(address _dm) external onlyOwner {
+        address old = delegationManager;
+        delegationManager = _dm;
+        emit DelegationManagerSet(old, _dm);
+    }
+
+    function addWatched(address op) external onlyOwner {
+        require(!isWatched[op], "already watched");
+        isWatched[op] = true;
+        watchedOperators.push(op);
+        emit WatchedAdded(op);
+    }
+
+    function removeWatched(address op) external onlyOwner {
+        require(isWatched[op], "not watched");
+        isWatched[op] = false;
+        // swap-pop to avoid unbounded gas on remove
+        for (uint i = 0; i < watchedOperators.length; i++) {
+            if (watchedOperators[i] == op) {
+                watchedOperators[i] = watchedOperators[watchedOperators.length - 1];
+                watchedOperators.pop();
+                break;
+            }
+        }
+        emit WatchedRemoved(op);
+    }
+
+    /// snapshot single operator's current status into lastSeenStatus (owner only)
+    /// This is a cheap single read; owner should call periodically to establish baseline
+    function snapshotOperator(address op) external onlyOwner {
+        require(delegationManager != address(0), "dm zero");
+        uint8 st = IDelegationManager(delegationManager).operatorStatus(op);
+        lastSeenStatus[op] = st;
+        emit Snapshot(op, st);
+    }
+
+    /// snapshot all watched operators at once (owner only)
+    function snapshotAll() external onlyOwner {
+        require(delegationManager != address(0), "dm zero");
+        for (uint i = 0; i < watchedOperators.length; i++) {
+            address op = watchedOperators[i];
+            uint8 st = IDelegationManager(delegationManager).operatorStatus(op);
+            lastSeenStatus[op] = st;
+            emit Snapshot(op, st);
+        }
+    }
+
+    /* ---------------------------------------
+       Required Drosera functions (exact signatures)
+       collect() external view returns (bytes memory)
+       shouldRespond(bytes[] calldata data) external pure returns (bool, bytes memory)
+       --------------------------------------- */
+
+    /// collect: external view; returns abi.encode(delegationManager, ops[], lasts[], currents[], ts)
+    /// - cheap: single slot reads per watched operator
+    /// - includes ts (block.timestamp) so shouldRespond can validate expiries if needed
+    function collect() external view returns (bytes memory) {
+        uint256 n = watchedOperators.length;
+        address[] memory ops = new address[](n);
+        uint8[] memory lasts = new uint8[](n);
+        uint8[] memory currents = new uint8[](n);
+
+        for (uint i = 0; i < n; i++) {
+            address op = watchedOperators[i];
+            ops[i] = op;
+            lasts[i] = lastSeenStatus[op];
+            if (delegationManager != address(0)) {
+                currents[i] = IDelegationManager(delegationManager).operatorStatus(op);
+            } else {
+                currents[i] = 0;
+            }
+        }
+
+        return abi.encode(delegationManager, ops, lasts, currents, uint64(block.timestamp));
+    }
+
+    /// shouldRespond: pure — deterministic. Inspect newest sample at data[0].
+    /// - Decoding shape must match collect() above
+    /// - If any op changed from last -> current and the current is considered "unhealthy"
+    ///   (here we treat status != 1 as unhealthy; adapt as needed), return true and payload:
+    ///     abi.encode(operator, oldStatus, newStatus, bytes32("OP_STATUS_DRIFT"))
+    function shouldRespond(bytes[] calldata data) external pure returns (bool, bytes memory) {
+        if (data.length == 0) return (false, bytes(""));
+
+        // newest at index 0
+        (address delegationManager_, address[] memory ops, uint8[] memory lasts, uint8[] memory currents, uint64 ts) =
+            abi.decode(data[0], (address, address[], uint8[], uint8[], uint64));
+
+        // sanity checks
+        if (ops.length != lasts.length || ops.length != currents.length) {
+            return (false, bytes(""));
+        }
+
+        // iterate and detect first unhealthy transition (deterministic: iterate low->high)
+        for (uint i = 0; i < ops.length; i++) {
+            uint8 oldS = lasts[i];
+            uint8 newS = currents[i];
+
+            // if statuses differ
+            if (newS != oldS) {
+                // define "healthy" state as 1 (example); any other status is treated as problematic
+                // NOTE: keep logic simple and deterministic
+                if (newS != 1) {
+                    // responder expects (address operator, uint8 oldStatus, uint8 newStatus, bytes32 tag)
+                    bytes32 tag = bytes32("OP_STATUS_DRIFT");
+                    return (true, abi.encode(ops[i], oldS, newS, tag));
+                }
+            }
+        }
+
+        return (false, bytes(""));
+    }
+
+    /* ---------------- optional helpers ---------------- */
+
+    function ownerTransfer(address newOwner) external onlyOwner {
+        owner = newOwner;
+    }
+
+    // helper: view length of watchedOperators
+    function watchedLength() external view returns (uint256) {
+        return watchedOperators.length;
+    }
+}
