@@ -1,121 +1,89 @@
-# Operator-Status-Drift-Trap
-# OperatorStatusDriftTrap — EigenLayer Operator Status Drift Detector (PoC)
+---
+
+# Operator Status Drift Trap
 
 ## Overview
-**OperatorStatusDriftTrap** is a [Drosera](https://drosera.network)–compatible trap deployed on the Hoodi testnet.  
-It monitors EigenLayer operator **status changes** via the `DelegationManager` contract and emits an alert whenever an operator’s status drifts from its previously snapshotted value.
 
-The trap is designed as a PoC to demonstrate how Drosera traps can integrate with EigenLayer primitives to surface slashing risk or unexpected operator state changes.
+The **Operator Status Drift Trap** is a **Drosera-compatible monitoring contract** designed for the **EigenLayer Hoodi testnet**. It tracks changes in registered operator statuses within the `DelegationManager` and detects **status drifts** that deviate from a predefined set of “healthy” states encoded in the `OperatorConfig`.
 
----
-
-## Architecture
-- **`OperatorStatusDriftTrap.sol`**  
-  Implements Drosera’s `ITrap` interface.  
-  - `collect()` snapshots the current operator status and encodes it.  
-  - `shouldRespond()` deterministically inspects encoded history and signals when a status change is detected.
-- **`OperatorResponder.sol`**  
-  Simple response contract that emits an `OperatorAlert` event when called.  
-  In production, responders can trigger governance actions, alerts, or AVS-specific mitigations.
-- **`drosera.toml`**  
-  Configuration file for the Drosera relay to manage and route trap responses.
+This trap can serve as a sentinel for **EigenLayer protocol resilience testing**, automatically triggering a Drosera response when operator status mismatches occur beyond acceptable bounds.
 
 ---
 
-## Key Invariants
-The trap detects:
-- **Operator status drift**: If an operator’s status code (`uint8`) differs from the previously snapshotted status, the trap signals a response.
-- Encoded payload returned by `shouldRespond` is:
-  ```solidity
-  abi.encode(address operator, uint8 oldStatus, uint8 newStatus, bytes32 tag)
-````
+## Key Components
 
-where `tag` is fixed as `bytes32("OP_STATUS_DRIFT")`.
+### 1. OperatorConfig.sol
 
----
+This contract stores operator-level configurations, including:
 
-## Hoodi Testnet Integration
+* Allowed “healthy” status bitmask (encoded in `allowedMask`).
+* Operator’s address and their assigned configuration.
+* Config management functions callable via `cast send`.
 
-* **DelegationManager (Hoodi proxy)**:
-  `0x867837a9722C512e0862d8c2E15b8bE220E8b87d`
-  Used to fetch operator statuses.
+The healthy condition is no longer fixed to `status == 1`; it now checks whether `(1 << status)` falls within the configured `allowedMask`, allowing flexible health-state definitions.
 
-* **Drosera relay address** (example):
-  `0x91cB447BaFc6e0EA0F4Fe056F5a9b1F14bb06e5D`
-
-Update `drosera.toml` with the correct deployed addresses for both the trap and responder.
-
----
-
-## Deployment & Configuration
-
-### 1. Build and Deploy
-
-```bash
-forge build
-forge create src/OperatorStatusDriftTrap.sol:OperatorStatusDriftTrap --rpc-url https://ethereum-hoodi-rpc.publicnode.com --private-key $PK
-forge create src/OperatorResponder.sol:OperatorResponder --rpc-url https://ethereum-hoodi-rpc.publicnode.com --private-key $PK
-```
-
-### 2. Configure the Trap
-
-```bash
-# Set delegation manager
-cast send <TRAP> "setDelegationManager(address)" 0x867837a9722C512e0862d8c2E15b8bE220E8b87d --private-key $PK --rpc-url https://ethereum-hoodi-rpc.publicnode.com
-
-# Add watched operator
-cast send <TRAP> "addWatched(address)" 0xOPERATOR --private-key $PK --rpc-url https://ethereum-hoodi-rpc.publicnode.com
-
-# Snapshot operator baseline
-cast send <TRAP> "snapshotOperator(address)" 0xOPERATOR --private-key $PK --rpc-url https://ethereum-hoodi-rpc.publicnode.com
+```solidity
+function isHealthy(uint8 status) external view returns (bool) {
+    return (allowedMask & (1 << status)) != 0;
+}
 ```
 
 ---
 
-## Testing the Trap
+### 2. OperatorStatusDriftTrap.sol
 
-### Collect Data
+Implements the Drosera `ITrap` interface and operates as a lightweight, view-only monitor for operator health.
+It collects operator status data directly from the **DelegationManager** deployed on the **Hoodi testnet**.
 
-```bash
-COLLECT_HEX=$(cast call <TRAP> "collect()" --rpc-url https://ethereum-hoodi-rpc.publicnode.com)
-echo $COLLECT_HEX
-```
+* `collect()` samples operator status from the on-chain registry and returns encoded data for Drosera analysis.
+* `shouldRespond()` deterministically compares the sampled data to the configured healthy mask and signals Drosera when an anomaly is detected.
 
-### Run `shouldRespond`
+**Core Logic:**
 
-```bash
-cast call <TRAP> "shouldRespond(bytes[])" [$COLLECT_HEX] --rpc-url https://ethereum-hoodi-rpc.publicnode.com
-```
+```solidity
+function collect() external view override returns (bytes memory) {
+    uint8 status = IDelegationManager(DELEGATION_MANAGER).getOperatorStatus(OPERATOR);
+    return abi.encode(Sample({status: status}));
+}
 
-### Decode Payload
-
-If `shouldRespond` returns `true`, decode the payload:
-
-```bash
-cast abi-decode "(address,uint8,uint8,bytes32)" 0x<RESPONSE_HEX>
+function shouldRespond(bytes[] calldata data)
+    external
+    view
+    override
+    returns (bool, bytes memory)
+{
+    if (data.length == 0) return (false, "");
+    Sample memory s = abi.decode(data[0], (Sample));
+    bool healthy = IOperatorConfig(CONFIG).isHealthy(s.status);
+    if (!healthy) {
+        return (true, abi.encode(OPERATOR, bytes32("STATUS_DRIFT")));
+    }
+    return (false, "");
+}
 ```
 
 ---
 
-## Triggering the Responder
+### 3. OperatorResponder.sol
 
-To manually test responder calls:
+The responder executes a recovery or mitigation action when Drosera triggers a response.
+This can include:
 
-```bash
-cast send <RESPONDER> "respondWithOperatorAlert(address,uint8,uint8,bytes32)" \
-  0xOPERATOR 1 2 0x4f505f5354415455535f4452494654 \
-  --private-key $PK --rpc-url https://ethereum-hoodi-rpc.publicnode.com
-```
+* Emitting on-chain alerts,
+* Pausing protocol interactions,
+* Or notifying other system contracts depending on operator configuration.
 
-This will emit the `OperatorAlert` event with the detected drift.
+It validates Drosera dispatches and decodes payloads generated by `shouldRespond()`.
 
 ---
 
-## drosera.toml Example
+### 4. drosera.toml
+
+The Drosera configuration file defines trap deployment and monitoring parameters.
 
 ```toml
 ethereum_rpc = "https://ethereum-hoodi-rpc.publicnode.com"
-drosera_rpc  = "https://relay.hoodi.drosera.io"
+drosera_rpc = "https://relay.hoodi.drosera.io"
 eth_chain_id = 560048
 drosera_address = "0x91cB447BaFc6e0EA0F4Fe056F5a9b1F14bb06e5D"
 
@@ -123,17 +91,69 @@ drosera_address = "0x91cB447BaFc6e0EA0F4Fe056F5a9b1F14bb06e5D"
 
 [traps.operator_status_drift]
 path = "out/OperatorStatusDriftTrap.sol/OperatorStatusDriftTrap.json"
-response_contract = "0xRESPONDER"   # replace after deployment
+response_contract = "0x48204730bce8de630d68d80e6e3c84844a685d18"
 response_function = "respondWithOperatorAlert(address,uint8,uint8,bytes32)"
 cooldown_period_blocks = 30
 min_number_of_operators = 1
-max_number_of_operators = 5
-block_sample_size = 20
+max_number_of_operators = 2
+block_sample_size = 2
 private_trap = true
-whitelist = ["0x83cd7e5604ff5823734ddfbd82820c0965498284"]
-address = "0xTRAP"  # replace after deployment
+whitelist = ["0xcfE6dA9D82BE3bD159e2C1386302FbA0740022E2"]
+address = ["0xB7a726806A6524e1a3b06Ee9b5160572aC2CAbB8"]
 ```
 
 ---
-Do you want me to also include a **diagram (architecture / data flow)** in the README (ASCII or Mermaid), so it’s more visual when viewed on GitHub?
+
+## Cast Commands
+
+Use these Foundry `cast` commands to interact and test the trap.
+
+### 1. Set Healthy Mask
+
+```bash
+cast send <CONFIG_ADDRESS> \
+"setAllowedMask(uint256)" 0x3 \
+--private-key $PRIVATE_KEY
 ```
+
+### 2. Collect Operator Sample
+
+```bash
+cast call <TRAP_ADDRESS> "collect()"
+```
+
+### 3. Evaluate Trap Decision
+
+```bash
+cast call <TRAP_ADDRESS> \
+"shouldRespond(bytes[])" \
+"[$(cast call <TRAP_ADDRESS> collect)]"
+```
+
+### 4. Trigger Response (if applicable)
+
+```bash
+cast send <RESPONDER_ADDRESS> \
+"respond(bytes)" \
+"$(cast call <TRAP_ADDRESS> collect)" \
+--private-key $PRIVATE_KEY
+```
+
+---
+
+## How It Works
+
+1. **Monitoring**:
+   The trap reads operator status directly from the **DelegationManager** on the Hoodi testnet.
+
+2. **Evaluation**:
+   The trap encodes each sample and stores it for Drosera’s time-series analysis.
+
+3. **Detection**:
+   If an operator’s status no longer matches the allowed mask set in `OperatorConfig`, the trap returns a positive response signal.
+
+4. **Response Execution**:
+   The `OperatorResponder` receives the Drosera payload and executes the designated fallback or alert routine.
+
+---
+
